@@ -104,7 +104,9 @@ export default function Home() {
   });
   const [message, setMessage] = useState('');
   const [listening, setListening] = useState(false);
+  const [mobileAssist, setMobileAssist] = useState<'voice' | 'paste' | null>(null);
   const recognitionRef = useRef<{ stop: () => void } | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     try {
@@ -148,13 +150,17 @@ export default function Home() {
   }
 
   async function pasteText() {
+    setMobileAssist(null);
     try {
+      if (!navigator.clipboard?.readText) throw new Error('unsupported');
       const text = await navigator.clipboard.readText();
       if (!text) throw new Error('empty');
       setSource((current) => current ? `${current}\n${text}` : text);
       setMessage('已粘贴剪贴板文本。');
     } catch {
-      setMessage('无法读取剪贴板，请使用 Ctrl/⌘ + V 粘贴。');
+      textareaRef.current?.focus();
+      setMobileAssist('paste');
+      setMessage('输入框已激活，请长按输入框并选择“粘贴”。');
     }
   }
 
@@ -168,7 +174,9 @@ export default function Home() {
     const SpeechRecognition = (window as unknown as { webkitSpeechRecognition?: new () => any; SpeechRecognition?: new () => any }).SpeechRecognition
       || (window as unknown as { webkitSpeechRecognition?: new () => any }).webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      setMessage('当前浏览器不支持语音识别，请使用 Chrome 或 Edge。');
+      textareaRef.current?.focus();
+      setMobileAssist('voice');
+      setMessage('手机键盘已打开，请点击键盘上的麦克风开始说话。');
       return;
     }
     const recognition = new SpeechRecognition();
@@ -187,6 +195,7 @@ export default function Home() {
     recognitionRef.current = recognition;
     recognition.start();
     setListening(true);
+    setMobileAssist(null);
     setMessage('正在聆听…');
   }
 
@@ -241,21 +250,38 @@ export default function Home() {
             <div className="view-title"><span>第 1 步</span><h1>把事情交给我</h1><p>粘贴通知或直接说出来，我会整理成一张可确认的事项卡片。</p></div>
             <div className="input-box">
               <textarea
+                ref={textareaRef}
                 value={source}
                 onChange={(event) => setSource(event.target.value)}
+                onPaste={() => {
+                  setMessage('已粘贴内容，可以继续补充或生成卡片。');
+                  setMobileAssist(null);
+                }}
                 placeholder={'例如：\n创新创业比赛报名，9月12日18:00前提交到比赛官网，需要准备报名表、项目介绍和成员信息。'}
                 aria-label="输入事项信息"
+                inputMode="text"
+                enterKeyHint="done"
                 autoFocus
               />
               <div className="input-actions">
                 <div>
-                  <button className={listening ? 'tool-button listening' : 'tool-button'} onClick={toggleVoice}><span>●</span>{listening ? '结束录音' : '语音输入'}</button>
-                  <button className="tool-button" onClick={pasteText}><span>▣</span>一键粘贴</button>
+                  <button className={listening ? 'tool-button listening' : 'tool-button'} onClick={toggleVoice}><span>●</span>{listening ? '结束录音' : '手机语音'}</button>
+                  <button className="tool-button" onClick={pasteText}><span>▣</span>粘贴内容</button>
                   <button className="tool-button quiet" onClick={() => { setSource(sampleText); setMessage('已填入示例。'); }}>使用示例</button>
                 </div>
                 <button className="primary-button" onClick={createCard}>生成事项卡片 <span>→</span></button>
               </div>
             </div>
+            {mobileAssist && (
+              <div className="mobile-assist" role="status">
+                <span>{mobileAssist === 'voice' ? '🎙' : '▣'}</span>
+                <div>
+                  <strong>{mobileAssist === 'voice' ? '使用手机键盘语音' : '使用手机原生粘贴'}</strong>
+                  <p>{mobileAssist === 'voice' ? '点击键盘上的麦克风图标，说完后文字会直接进入输入框。' : '长按上方输入框，在系统菜单中选择“粘贴”。'}</p>
+                </div>
+                <button onClick={() => setMobileAssist(null)}>知道了</button>
+              </div>
+            )}
             {message && <p className="message" role="status">{message}</p>}
           </div>
         )}
