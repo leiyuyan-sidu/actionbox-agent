@@ -1,161 +1,312 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
-const tasks = [
-  { title: '填写报名表' },
-  { title: '准备项目介绍' },
-  { title: '收集成员信息' },
-  { title: '联系指导老师签字' },
-];
+type Stage = 'input' | 'card' | 'calendar';
 
-const planItems = [
-  { title: '比赛报名', date: '9月12日', days: '还剩 15 天', width: 92, tone: 'blue' },
-  { title: '课程作业', date: '9月5日', days: '还剩 8 天', width: 57, tone: 'orange' },
-  { title: '产品会议', date: '9月1日', days: '还剩 4 天', width: 34, tone: 'purple' },
-];
+type Draft = {
+  title: string;
+  deadline: string;
+  submitTo: string;
+  overview: string;
+  items: string;
+};
+
+type CalendarEvent = Draft & {
+  id: string;
+  createdAt: string;
+};
+
+const STORAGE_KEY = 'actionbox-events-v1';
+
+const sampleText = `创新创业比赛报名
+截止时间：2026年9月12日 18:00
+提交至：比赛官网
+负责人：张老师
+- 填写报名表
+- 准备项目介绍
+- 收集成员信息
+- 联系指导老师签字`;
+
+function pad(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function toLocalInput(date: Date) {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function extractDeadline(text: string) {
+  const normalized = text.replace(/[／/]/g, '-');
+  const full = normalized.match(/(20\d{2})[年-](\d{1,2})[月-](\d{1,2})日?(?:\s*[日号])?(?:\s*(\d{1,2})(?:[:：时](\d{1,2}))?分?)?/);
+  const short = normalized.match(/(?:截止(?:时间)?|截至|日期)?[^\d]{0,6}(\d{1,2})月(\d{1,2})日(?:\s*(\d{1,2})(?:[:：时](\d{1,2}))?分?)?/);
+  const relative = new Date();
+
+  if (/后天/.test(text)) relative.setDate(relative.getDate() + 2);
+  else if (/明天/.test(text)) relative.setDate(relative.getDate() + 1);
+  else if (/今天/.test(text)) relative.setDate(relative.getDate());
+  else if (!full && !short) {
+    relative.setDate(relative.getDate() + 7);
+    relative.setHours(18, 0, 0, 0);
+    return toLocalInput(relative);
+  }
+
+  if (full) {
+    const [, year, month, day, hour = '18', minute = '0'] = full;
+    return `${year}-${pad(Number(month))}-${pad(Number(day))}T${pad(Number(hour))}:${pad(Number(minute))}`;
+  }
+
+  if (short) {
+    const [, month, day, hour = '18', minute = '0'] = short;
+    return `${new Date().getFullYear()}-${pad(Number(month))}-${pad(Number(day))}T${pad(Number(hour))}:${pad(Number(minute))}`;
+  }
+
+  const time = text.match(/(\d{1,2})[:：时](\d{1,2})?/);
+  relative.setHours(Number(time?.[1] ?? 18), Number(time?.[2] ?? 0), 0, 0);
+  return toLocalInput(relative);
+}
+
+function parseText(text: string): Draft {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const taskLines = lines
+    .filter((line) => /^[-•·✓□]|^\d+[.、]/.test(line))
+    .map((line) => line.replace(/^[-•·✓□\s]+|^\d+[.、]\s*/g, '').trim());
+  const submitMatch = text.match(/(?:提交至|提交到|发送至|发送到|交给|提交渠道)[:：]?\s*([^，。；\n]+)/);
+  const ownerMatch = text.match(/(?:负责人|联系人)[:：]?\s*([^，。；\n]+)/);
+  const firstContentLine = lines.find((line) => !/(截止|截至|提交至|提交到|负责人|联系人)/.test(line) && !/^[-•·✓□]|^\d+[.、]/.test(line));
+  const title = (firstContentLine || '未命名事项').replace(/^(事项|任务)[:：]\s*/, '').slice(0, 36);
+
+  return {
+    title,
+    deadline: extractDeadline(text),
+    submitTo: [submitMatch?.[1], ownerMatch ? `负责人：${ownerMatch[1]}` : ''].filter(Boolean).join(' · ') || '待补充',
+    overview: lines.filter((line) => !/^[-•·✓□]|^\d+[.、]/.test(line)).slice(0, 4).join('；'),
+    items: taskLines.join('\n') || '完成并提交事项',
+  };
+}
+
+function formatDeadline(value: string) {
+  const date = new Date(value);
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: 'long', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(date);
+}
 
 export default function Home() {
-  const [recording, setRecording] = useState(false);
-  const [pasted, setPasted] = useState(false);
-  const [confirmed, setConfirmed] = useState(false);
-  const [completed, setCompleted] = useState([true, false, false, false]);
+  const [stage, setStage] = useState<Stage>('input');
+  const [source, setSource] = useState('');
+  const [draft, setDraft] = useState<Draft>(() => parseText(sampleText));
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [storageLoaded, setStorageLoaded] = useState(false);
+  const [month, setMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
+  const [message, setMessage] = useState('');
+  const [listening, setListening] = useState(false);
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
 
-  const completeCount = useMemo(() => completed.filter(Boolean).length, [completed]);
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(STORAGE_KEY);
+      if (saved) setEvents(JSON.parse(saved));
+    } catch {
+      setMessage('当前浏览器无法读取已保存事项。');
+    } finally {
+      setStorageLoaded(true);
+    }
+  }, []);
 
-  function toggleTask(index: number) {
-    setCompleted((current) => current.map((item, itemIndex) => itemIndex === index ? !item : item));
+  useEffect(() => {
+    if (!storageLoaded) return;
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(events));
+    } catch {
+      // The app remains usable for this session when storage is unavailable.
+    }
+  }, [events, storageLoaded]);
+
+  const calendarCells = useMemo(() => {
+    const year = month.getFullYear();
+    const monthIndex = month.getMonth();
+    const firstWeekday = new Date(year, monthIndex, 1).getDay();
+    const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+    return [
+      ...Array.from({ length: firstWeekday }, () => null),
+      ...Array.from({ length: daysInMonth }, (_, index) => index + 1),
+    ];
+  }, [month]);
+
+  function createCard() {
+    if (!source.trim()) {
+      setMessage('请先输入一段事项信息。');
+      return;
+    }
+    setDraft(parseText(source));
+    setMessage('');
+    setStage('card');
+  }
+
+  async function pasteText() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) throw new Error('empty');
+      setSource((current) => current ? `${current}\n${text}` : text);
+      setMessage('已粘贴剪贴板文本。');
+    } catch {
+      setMessage('无法读取剪贴板，请使用 Ctrl/⌘ + V 粘贴。');
+    }
+  }
+
+  function toggleVoice() {
+    if (listening) {
+      recognitionRef.current?.stop();
+      setListening(false);
+      return;
+    }
+
+    const SpeechRecognition = (window as unknown as { webkitSpeechRecognition?: new () => any; SpeechRecognition?: new () => any }).SpeechRecognition
+      || (window as unknown as { webkitSpeechRecognition?: new () => any }).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setMessage('当前浏览器不支持语音识别，请使用 Chrome 或 Edge。');
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'zh-CN';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.onresult = (event: any) => {
+      const transcript = event.results?.[0]?.[0]?.transcript ?? '';
+      setSource((current) => current ? `${current}\n${transcript}` : transcript);
+    };
+    recognition.onend = () => setListening(false);
+    recognition.onerror = () => {
+      setListening(false);
+      setMessage('语音识别没有成功，请检查麦克风权限。');
+    };
+    recognitionRef.current = recognition;
+    recognition.start();
+    setListening(true);
+    setMessage('正在聆听…');
+  }
+
+  function confirmEvent() {
+    if (!draft.title.trim() || !draft.deadline) {
+      setMessage('事项名称和截止时间不能为空。');
+      return;
+    }
+    const event: CalendarEvent = {
+      ...draft,
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      createdAt: new Date().toISOString(),
+    };
+    setEvents((current) => [...current, event]);
+    const deadline = new Date(draft.deadline);
+    setMonth(new Date(deadline.getFullYear(), deadline.getMonth(), 1));
+    setStage('calendar');
+    setMessage('事项已加入日历。');
+  }
+
+  function startNew() {
+    setSource('');
+    setDraft(parseText(sampleText));
+    setMessage('');
+    setStage('input');
+  }
+
+  function eventsForDay(day: number) {
+    return events.filter((event) => {
+      const date = new Date(event.deadline);
+      return date.getFullYear() === month.getFullYear() && date.getMonth() === month.getMonth() && date.getDate() === day;
+    });
   }
 
   return (
-    <main className="app-shell">
-      <aside className="sidebar" aria-label="主导航">
-        <div className="brand-mark">A</div>
-        <nav className="side-nav">
-          <button className="nav-item active"><span className="nav-glyph">⌂</span><span>收件箱</span><b>2</b></button>
-          <button className="nav-item"><span className="nav-glyph">▥</span><span>计划</span></button>
-          <button className="nav-item"><span className="nav-glyph">✓</span><span>待办</span></button>
-          <button className="nav-item"><span className="nav-glyph">◇</span><span>已完成</span></button>
-        </nav>
-        <div className="sidebar-bottom">
-          <button className="nav-item"><span className="nav-glyph">?</span><span>帮助</span></button>
-          <button className="nav-item"><span className="nav-glyph">⚙</span><span>设置</span></button>
-          <div className="profile"><span className="avatar">林</span><div><strong>林澈</strong><small>个人空间</small></div></div>
+    <main className="app">
+      <header className="app-header">
+        <button className="logo" onClick={startNew} aria-label="返回输入页"><span>A</span><strong>ActionBox</strong></button>
+        <div className="steps" aria-label="使用流程">
+          <button className={stage === 'input' ? 'active' : ''} onClick={() => setStage('input')}><i>1</i>输入</button>
+          <span />
+          <button className={stage === 'card' ? 'active' : ''} disabled={stage === 'input'} onClick={() => setStage('card')}><i>2</i>确认</button>
+          <span />
+          <button className={stage === 'calendar' ? 'active' : ''} onClick={() => setStage('calendar')}><i>3</i>日历</button>
         </div>
-      </aside>
+        <button className="calendar-shortcut" onClick={() => setStage('calendar')}>日历 <b>{events.length}</b></button>
+      </header>
 
-      <section className="workspace">
-        <header className="topbar">
-          <div className="mobile-brand"><span className="brand-mark">A</span><strong>ActionBox</strong></div>
-          <div className="desktop-title"><p>8月28日 · 星期五</p><h1>上午好，林澈</h1></div>
-          <button className="search-button" aria-label="搜索事项"><span>⌕</span><span className="search-label">搜索事项</span><kbd>⌘ K</kbd></button>
-          <button className="notice-button" aria-label="通知">●</button>
-          <span className="mobile-avatar">林</span>
-        </header>
-
-        <div className="content-wrap">
-          <section className="mobile-greeting"><p>8月28日 · 星期五</p><h1>上午好，林澈</h1></section>
-
-          <section className="capture-card" aria-labelledby="capture-title">
-            <div className="capture-copy">
-              <span className="eyebrow">行动收件箱</span>
-              <h2 id="capture-title">今天，要处理什么？</h2>
-              <p>把刚看到的信息交给我，我来提取事项和截止时间。</p>
+      <section className="screen">
+        {stage === 'input' && (
+          <div className="input-view">
+            <div className="view-title"><span>第 1 步</span><h1>把事情交给我</h1><p>粘贴通知或直接说出来，我会整理成一张可确认的事项卡片。</p></div>
+            <div className="input-box">
+              <textarea
+                value={source}
+                onChange={(event) => setSource(event.target.value)}
+                placeholder={'例如：\n创新创业比赛报名，9月12日18:00前提交到比赛官网，需要准备报名表、项目介绍和成员信息。'}
+                aria-label="输入事项信息"
+                autoFocus
+              />
+              <div className="input-actions">
+                <div>
+                  <button className={listening ? 'tool-button listening' : 'tool-button'} onClick={toggleVoice}><span>●</span>{listening ? '结束录音' : '语音输入'}</button>
+                  <button className="tool-button" onClick={pasteText}><span>▣</span>一键粘贴</button>
+                  <button className="tool-button quiet" onClick={() => { setSource(sampleText); setMessage('已填入示例。'); }}>使用示例</button>
+                </div>
+                <button className="primary-button" onClick={createCard}>生成事项卡片 <span>→</span></button>
+              </div>
             </div>
-
-            <div className="recent-shot">
-              <div className="shot-preview" aria-hidden="true">
-                <span className="shot-dot red" /><span className="shot-dot yellow" /><span className="shot-dot green" />
-                <div className="shot-lines"><i /><i /><i /><i /></div>
-              </div>
-              <div className="shot-info"><strong>检测到刚刚的截图</strong><span>比赛报名通知 · 1分钟前</span></div>
-              <button className="use-shot">已加入 <span>✓</span></button>
-            </div>
-
-            {pasted && <div className="pasted-chip"><span>剪贴板</span> 已加入补充通知文本 <button onClick={() => setPasted(false)} aria-label="移除剪贴板内容">×</button></div>}
-            {recording && <div className="voice-line"><span className="pulse" />正在聆听：请说出你希望如何处理这件事…</div>}
-
-            <div className="capture-actions">
-              <button className={recording ? 'action-button recording' : 'action-button'} onClick={() => setRecording(!recording)}><span className="action-icon mic">●</span>{recording ? '结束录音' : '说出需求'}</button>
-              <button className="action-button" onClick={() => setPasted(true)}><span className="action-icon">▣</span>粘贴内容</button>
-              <button className="action-button"><span className="action-icon">＋</span>添加文件</button>
-              <button className="analyze-button">开始分析 <span>→</span></button>
-            </div>
-          </section>
-
-          <div className="dashboard-grid">
-            <section className="result-panel">
-              <div className="section-heading">
-                <div><span className="status-dot" /><h2>{confirmed ? '已加入待办' : '待你确认'}</h2><span className="count-pill">1</span></div>
-                <button>查看全部</button>
-              </div>
-
-              <article className={confirmed ? 'event-card confirmed' : 'event-card'}>
-                <div className="event-topline">
-                  <div><span className="event-label">报名事项</span><span className="source-label">来自 2 份材料</span></div>
-                  <button className="more-button" aria-label="更多操作">•••</button>
-                </div>
-                <h3>创新创业比赛报名</h3>
-                <p className="event-summary">完成参赛信息填写并提交项目材料，需指导老师签字确认。</p>
-
-                <div className="event-meta">
-                  <div><span className="meta-icon calendar-icon">□</span><p><small>截止时间</small><strong>9月12日 周六 18:00</strong></p><span className="urgent-pill">还剩15天</span></div>
-                  <div><span className="meta-icon">◎</span><p><small>提交至</small><strong>比赛官网 · 在线提交</strong></p></div>
-                  <div><span className="meta-icon">人</span><p><small>负责人</small><strong>张老师 · 创新中心</strong></p></div>
-                </div>
-
-                <div className="task-block">
-                  <div className="task-title"><strong>需要完成</strong><span>{completeCount}/{tasks.length}</span></div>
-                  <div className="task-list">
-                    {tasks.map((task, index) => (
-                      <button key={task.title} className={completed[index] ? 'task-row done' : 'task-row'} onClick={() => toggleTask(index)}>
-                        <span className="check">{completed[index] ? '✓' : ''}</span><span>{task.title}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="event-footer">
-                  <button className="source-button">▤ 查看原文依据</button>
-                  <div><button className="ghost-button">修改信息</button><button className="confirm-button" onClick={() => setConfirmed(true)}>{confirmed ? '已加入待办 ✓' : '确认并加入待办'}</button></div>
-                </div>
-              </article>
-            </section>
-
-            <aside className="plan-panel">
-              <div className="section-heading"><div><h2>截止计划</h2></div><button>本月⌄</button></div>
-              <div className="plan-card">
-                <div className="plan-header"><span>8月28日</span><span>9月12日</span></div>
-                <div className="today-marker"><span>今天</span></div>
-                <div className="plan-list">
-                  {planItems.map((item) => (
-                    <div className="plan-row" key={item.title}>
-                      <div className="plan-copy"><strong>{item.title}</strong><span>{item.days}</span></div>
-                      <div className="bar-track"><span className={`bar-fill ${item.tone}`} style={{ width: `${item.width}%` }}><i /></span></div>
-                      <time>{item.date}</time>
-                    </div>
-                  ))}
-                </div>
-                <button className="full-plan-button">打开完整计划视图 <span>→</span></button>
-              </div>
-
-              <div className="today-card">
-                <div><span className="today-date">28</span><p><strong>今天</strong><small>星期五</small></p></div>
-                <span>1 项即将截止</span>
-                <div className="today-task"><i /><p><strong>完善课程作业</strong><small>9月5日截止</small></p><button>○</button></div>
-              </div>
-            </aside>
+            {message && <p className="message" role="status">{message}</p>}
           </div>
-        </div>
-      </section>
+        )}
 
-      <nav className="mobile-nav" aria-label="移动端导航">
-        <button className="active"><span>⌂</span>收件箱<i>2</i></button>
-        <button><span>▥</span>计划</button>
-        <button className="mobile-add" aria-label="添加事项">＋</button>
-        <button><span>✓</span>待办</button>
-        <button><span>◇</span>我的</button>
-      </nav>
+        {stage === 'card' && (
+          <div className="card-view">
+            <div className="view-title"><span>第 2 步</span><h1>确认事项信息</h1><p>信息都可以修改，确认后才会写入日历。</p></div>
+            <article className="event-card">
+              <label className="field title-field"><span>事项名称</span><input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></label>
+              <div className="field-grid">
+                <label className="field"><span>截止时间</span><input type="datetime-local" value={draft.deadline} onChange={(event) => setDraft({ ...draft, deadline: event.target.value })} /></label>
+                <label className="field"><span>提交对象 / 地点</span><input value={draft.submitTo} onChange={(event) => setDraft({ ...draft, submitTo: event.target.value })} /></label>
+              </div>
+              <label className="field"><span>事项概述</span><textarea rows={3} value={draft.overview} onChange={(event) => setDraft({ ...draft, overview: event.target.value })} /></label>
+              <label className="field"><span>需要完成（每行一项）</span><textarea rows={5} value={draft.items} onChange={(event) => setDraft({ ...draft, items: event.target.value })} /></label>
+              <div className="card-preview-line"><span>截止</span><strong>{formatDeadline(draft.deadline)}</strong></div>
+              <div className="card-actions">
+                <button className="secondary-button" onClick={() => setStage('input')}>返回修改原文</button>
+                <button className="primary-button" onClick={confirmEvent}>确认并加入日历 <span>→</span></button>
+              </div>
+            </article>
+            {message && <p className="message" role="status">{message}</p>}
+          </div>
+        )}
+
+        {stage === 'calendar' && (
+          <div className="calendar-view">
+            <div className="calendar-top">
+              <div className="view-title compact"><span>第 3 步</span><h1>事项日历</h1><p>所有事项保存在当前浏览器中。</p></div>
+              <button className="primary-button small" onClick={startNew}>＋ 新建事项</button>
+            </div>
+            {message && <p className="message success" role="status">{message}</p>}
+            <section className="calendar-card">
+              <div className="calendar-toolbar">
+                <button aria-label="上个月" onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))}>‹</button>
+                <h2>{month.getFullYear()}年 {month.getMonth() + 1}月</h2>
+                <button aria-label="下个月" onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))}>›</button>
+              </div>
+              <div className="week-row">{['日','一','二','三','四','五','六'].map((day) => <span key={day}>周{day}</span>)}</div>
+              <div className="calendar-grid">
+                {calendarCells.map((day, index) => (
+                  <div className={day ? 'day-cell' : 'day-cell empty'} key={`${day}-${index}`}>
+                    {day && <><span className="day-number">{day}</span><div className="day-events">{eventsForDay(day).map((event) => <div className="calendar-event" key={event.id}><strong>{event.title}</strong><small>{new Date(event.deadline).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })} 截止</small><button aria-label={`删除${event.title}`} onClick={() => setEvents((current) => current.filter((item) => item.id !== event.id))}>×</button></div>)}</div></>}
+                  </div>
+                ))}
+              </div>
+            </section>
+            {events.length === 0 && <div className="empty-state"><span>□</span><h3>日历里还没有事项</h3><p>创建第一张事项卡片，它会出现在截止日期当天。</p><button className="primary-button small" onClick={startNew}>创建事项</button></div>}
+          </div>
+        )}
+      </section>
     </main>
   );
 }
